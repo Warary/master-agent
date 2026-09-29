@@ -153,11 +153,15 @@ class Master:
         messages = []
         for msg in recent:
             messages.append({"role": msg["role"], "content": msg["content"]})
+
         enhanced = self._enhance_question(question)
+
         # 只在被增强时提示，否则不打印，免得刷屏
         if enhanced != question:
             print(f"  📎 已注入上下文 (+{len(enhanced) - len(question)} 字)")
+
         messages.append({"role": "user", "content": enhanced})
+
         answer = ""
         print("\n陈大师：", end="", flush=True)
         for mode, data in self.agent.stream(
