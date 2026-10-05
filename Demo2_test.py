@@ -21,7 +21,7 @@ from langchain_chroma import Chroma
 load_dotenv()
 
 # 命理相关关键词，用于判断用户是否在问命理
-DESTINY_KEYWORDS = ["运势", "八字", "命", "今年", "事业", "财运", "感情", "健康", "流年"]
+DESTINY_KEYWORDS = ["运势", "八字", "命", "今年", "事业", "财运", "感情", "健康", "流年","五行"]
 
 
 class Master:
@@ -104,15 +104,28 @@ class Master:
             query 参数是用户问题的核心关键词，例如 '属兔运势'、'五行相生'。
             """
             print(f"  🔍 search_knowledge(\"{query}\")", end=" ")
-            results = self.vector_store.similarity_search(query, k=3)
+            results = self.vector_store.similarity_search(query, k=2)
             print(f"→ 命中 {len(results)} 条")
             if not results:
                 return "知识库中未找到相关信息。"
-            content = "\n---\n".join([doc.page_content for doc in results])
+            
+            # 核心优化：剥离Markdown格式，让模型无法直接复制
+            content_parts = []
+            for doc in results:
+                text = doc.page_content
+                text = re.sub(r'#+\s*', '', text)          # 去掉标题符号 #
+                text = re.sub(r'\*\*(.+?)\*\*', r'\1', text) # 去掉加粗 **
+                text = re.sub(r'\n{3,}', '\n\n', text)       # 压缩多余空行
+                content_parts.append(text.strip())
+            
+            content = "\n".join(content_parts)
+            
+            # 核心优化：下死命令，告诉它这是素材不是答案
             return (
-                f"<参考资料>\n{content}\n</参考资料>\n"
-                "回答要求：先用一句话总结资料的核心观点，再结合用户的具体问题展开。"
-                "语气像老先生聊天，不要像念书。"
+                f"【内部参考素材】\n{content}\n\n"
+                f"【铁律】以上是命理素材，不是给你的回答模板。"
+                f"你必须像陈大师坐在茶桌旁闲聊一样，用自己的话把素材里的道理讲出来。"
+                f"绝对禁止出现原文中的任何整句。如果讲不出来，就说'老夫学艺不精'。"
             )
 
         self.tools = [search_knowledge, get_bazi]
@@ -123,47 +136,109 @@ class Master:
             system_prompt=self.SYSTEM_PROMPT
         )
 
-    def _enhance_question(self, question: str) -> str:
-        """工程兜底：检测出生日期或命理提问，强制拼入排盘数据。"""
+    def _enhance_question(self, question: str, last_bazi: str) -> str:
+        """工作流编排：代码接管排盘与检索，模型只负责总结和说人话。"""
+        
+        # 1. 检测用户输入里是否包含出生日期
+        date_match = re.search(r"(\d{4})\s*[-/年]\s*(\d{1,2})\s*[-/月]\s*(\d{1,2})", question)
+        
+        # 2. 检测用户输入里是否包含生肖（比如“属马”）
+        zodiac_match = re.search(r"(属[鼠牛虎兔龙蛇马羊猴鸡狗猪])", question)
+        
+        # 获取当年的干支（用于组合检索词）
+        this_year = datetime.now().year
+        this_year_ganzhi = Solar.fromYmdHms(this_year, 1, 1, 0, 0, 0).getLunar().getYearInGanZhiByLiChun()
+
+        # ========== 分支 A：用户给了出生日期，进入完整排盘流程 ==========
+        if date_match:
+            y, m, d = date_match.groups()
+            birth = f"{y}-{int(m):02d}-{int(d):02d} 12:00"
+            bazi_result = get_bazi.invoke({"birth_datetime": birth})
+            print(f"  🔧 强排盘 get_bazi({birth})")
+            
+            # 代码强制构造检索词
+            query = f"{y}年 {this_year_ganzhi}年 流年 运势 五行生克"
+            docs = self.vector_store.similarity_search(query, k=3)
+            rag_content = "\n---\n".join([doc.page_content for doc in docs]) if docs else "知识库暂无相关记录"
+            print(f"  🔍 强制 RAG 检索 → 命中 {len(docs)} 条")
+            
+            return (
+                f"{question}\n\n"
+                f"【系统排盘数据】\n{bazi_result}\n\n"
+                f"【已检索的命理资料】\n{rag_content}\n\n"
+                f"【任务】请结合上述数据和资料，用陈大师的口吻回答。绝对不要原样输出数据和资料。"
+            )
+
+        # ========== 分支 B：用户给了生肖，没给日期 ==========
+        if zodiac_match and any(kw in question for kw in DESTINY_KEYWORDS):
+            zodiac = zodiac_match.group(1)[1]  # 提取“马”
+            print(f"  🔧 识别生肖：{zodiac}，强制 RAG 检索...")
+            
+            query = f"{zodiac} {this_year_ganzhi}年 流年 运势 合冲刑害"
+            docs = self.vector_store.similarity_search(query, k=3)
+            rag_content = "\n---\n".join([doc.page_content for doc in docs]) if docs else "知识库暂无相关记录"
+            print(f"  🔍 强制 RAG 检索 → 命中 {len(docs)} 条")
+            
+            return (
+                f"{question}\n\n"
+                f"【系统识别结果】用户生肖：{zodiac}，当年流年：{this_year_ganzhi}年\n\n"
+                f"【已检索的命理资料】\n{rag_content}\n\n"
+                f"【任务】请结合上述流年与生肖的生克关系，用陈大师口吻回答。严禁自行编造相冲相合关系，必须严格基于资料。"
+            )
+
+        # ========== 分支 C：万能兜底（覆盖历史排盘与一般命理问答） ==========
+        # 只要涉及命理关键词，不管有没有历史排盘，一律强制检索，杜绝模型瞎编
+        if any(kw in question for kw in DESTINY_KEYWORDS):
+            print(f"  🔧 识别到命理问题，强制 RAG 检索...")
+            
+            query = f"八字 流年 运势 事业 财运 感情 五行 {question}" if last_bazi else question
+            if last_bazi:
+                print(f"  🔧 复用历史排盘数据（已注入检索词）")
+            else:
+                query = question
+                
+            docs = self.vector_store.similarity_search(query, k=3)
+            rag_content = "\n---\n".join([doc.page_content for doc in docs]) if docs else "知识库暂无相关记录"
+            print(f"  🔍 强制 RAG 检索 → 命中 {len(docs)} 条")
+            
+            context_block = f"【系统排盘数据（历史）】\n{last_bazi}\n\n" if last_bazi else ""
+            
+            return (
+                f"{question}\n\n"
+                f"{context_block}"
+                f"【已检索的命理资料】\n{rag_content}\n\n"
+                f"【任务】请结合上述资料，用陈大师口吻回答。绝对不要原样输出资料。"
+            )
+
+        # ========== 分支 D：完全无关的问题，放行给模型 ==========
+        return question
+
+    def ask_stream(self, question: str, history: list, last_bazi: str):
+        """流式版本：yield token，附带系统标记，供前端保存状态。"""
+        recent = history[-20:] if history else []
+        messages = list(recent)
+
+        # 1. 检测日期，生成系统标记（供前端保存 last_bazi）
+        bazi_marker = ""
         date_match = re.search(r"(\d{4})\s*[-/年]\s*(\d{1,2})\s*[-/月]\s*(\d{1,2})", question)
         if date_match:
             y, m, d = date_match.groups()
             birth = f"{y}-{int(m):02d}-{int(d):02d} 12:00"
-            bazi = get_bazi.invoke({"birth_datetime": birth})
-            self.last_bazi = bazi
-            print(f"  🔧 get_bazi({birth})")
-            return (
-                f"{question}\n\n"
-                f"【系统排盘数据】\n{bazi}\n"
-                f"【请基于以上数据用陈大师口吻作答，不要原样输出，不得自行推算】"
-            )
+            bazi_result = get_bazi.invoke({"birth_datetime": birth})
+            # 把排盘结果包装进系统标记，前端会拦截并保存
+            bazi_marker = f"[SYSTEM_DATA:last_bazi: {bazi_result}]\n"
 
-        if self.last_bazi and any(kw in question for kw in DESTINY_KEYWORDS):
-            print(f"  🔧 复用上次排盘数据")
-            return (
-                f"{question}\n\n"
-                f"【系统排盘数据（该用户此前提供）】\n{self.last_bazi}\n"
-                f"【请基于以上数据作答】"
-            )
-
-        return question
-
-    def ask(self, question: str) -> str:
-        recent = self.memory[-20:]
-        messages = []
-        for msg in recent:
-            messages.append({"role": msg["role"], "content": msg["content"]})
-
-        enhanced = self._enhance_question(question)
-
-        # 只在被增强时提示，否则不打印，免得刷屏
+        # 2. 工作流编排（只用 last_bazi，不再用 self）
+        enhanced = self._enhance_question(question, last_bazi)
         if enhanced != question:
             print(f"  📎 已注入上下文 (+{len(enhanced) - len(question)} 字)")
-
         messages.append({"role": "user", "content": enhanced})
 
-        answer = ""
-        print("\n陈大师：", end="", flush=True)
+        # 3. 优先发送系统标记
+        if bazi_marker:
+            yield bazi_marker
+
+        # 4. 正常流式输出
         for mode, data in self.agent.stream(
             {"messages": messages},
             stream_mode=["messages", "values"]
@@ -173,63 +248,53 @@ class Master:
                 if getattr(chunk, "tool_call_chunks", None):
                     continue
                 if chunk.content:
-                    print(chunk.content, end="", flush=True)
-                    answer += chunk.content
-        print()
-        self.memory.append({"role": "user", "content": question})
-        self.memory.append({"role": "assistant", "content": answer})
-        self.memory = self.memory[-20:]
-        return answer
-
-    def ask_stream(self, question: str):
-        """流式版本：yield token，供 Streamlit 使用。结束后更新 memory。"""
-        recent = self.memory[-20:]
-        messages = []
-        for msg in recent:
-            messages.append({"role": msg["role"], "content": msg["content"]})
-
-        enhanced = self._enhance_question(question)
-        messages.append({"role": "user", "content": enhanced})
-
-        full_answer = ""
-        for mode, data in self.agent.stream(
-            {"messages": messages},
-            stream_mode=["messages", "values"]
-        ):
-            if mode == "messages":
-                chunk, metadata = data
-                if getattr(chunk, "tool_call_chunks", None):
-                    continue
-                if chunk.content:
-                    full_answer += chunk.content
                     yield chunk.content
-
-        self.memory.append({"role": "user", "content": question})
-        self.memory.append({"role": "assistant", "content": full_answer})
-        self.memory = self.memory[-20:]
 
     def save_memory(self):
         with open(self.MEMORY_KEY, "w", encoding="utf-8") as f:
             json.dump(self.memory, f, ensure_ascii=False, indent=2)
-
 
 if __name__ == "__main__":
     API_KEY = os.getenv("Zhipu_api_key")
     master = Master(api_key=API_KEY)
     print("✨ 陈大师已上线")
     print("  输入 'q' 退出 | 输入 'clear' 清空记忆")
+    
+    # 终端版本的本地状态
+    terminal_memory = []
+    terminal_last_bazi = None
+
     while True:
         q = input("你问：")
         if q.lower() == "q":
             break
         if q.lower() == "clear":
-            master.memory = []
-            master.last_bazi = None
+            terminal_memory = []
+            terminal_last_bazi = None
             if os.path.exists(master.MEMORY_KEY):
                 os.remove(master.MEMORY_KEY)
             print("🧹 记忆已清空，大师重新开张\n")
             continue
         if not q.strip():
             continue
-        master.ask(q)
-    master.save_memory()
+
+        # 调用无状态的 ask_stream，并手动拼接本地状态
+        full_answer = ""
+        print("\n陈大师：", end="", flush=True)
+        for chunk in master.ask_stream(q, terminal_memory, terminal_last_bazi):
+            # 拦截系统标记，终端版不显示，但提取出 last_bazi
+            if chunk.startswith("[SYSTEM_DATA:"):
+                m = re.search(r"last_bazi: (.*)]", chunk, re.DOTALL)
+                if m:
+                    terminal_last_bazi = m.group(1).strip()
+                continue
+            
+            # 正常文本内容
+            print(chunk, end="", flush=True)
+            full_answer += chunk
+        print()
+
+        # 更新终端本地记忆
+        terminal_memory.append({"role": "user", "content": q})
+        terminal_memory.append({"role": "assistant", "content": full_answer})
+        terminal_memory = terminal_memory[-20:]  # 滑动窗口
