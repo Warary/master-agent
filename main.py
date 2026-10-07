@@ -4,7 +4,7 @@ from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 import os 
 from dotenv import load_dotenv
-from Demo2 import Master
+from master import Master
 
 load_dotenv()
 
